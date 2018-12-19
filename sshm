@@ -46,11 +46,12 @@ ARGUMENTS:
 OPTIONS:
   -h|--help: print this help
 
-  -m|--mount       Mount the given host
-  -u|--unmount     Unmount the given host
-  -q|--query:      Show mounts
-  -a|--query-all:  Query the configuration and show mount status
-  -l|--list-hosts: List the configured hosts
+  -m|--mount          Mount the given host
+  -u|--unmount        Unmount the given host
+  -ua|--unmountall    Unmount all hosts
+  -q|--query:         Show mounts
+  -a|-qa|--query-all: Query the configuration and show mount status
+  -l|--list-hosts:    List the configured hosts
 
 SSHM_CONFIG_FILE:
 
@@ -65,6 +66,7 @@ EXAMPLES:
     sshm -u myhost  # unmount 'myhost', as defined in $SSHM_CONFIG_FILE
     sshm -q         # shows mounted hosts
     sshm -a         # shows all hosts
+    sshm -ua        # unmount all mounted hosts
 EOF
 exit 1
 }
@@ -127,31 +129,25 @@ parse_sshm_config() {
   unset IFS
 }
 
-check_mountdir_args() {
-  local mountdir="$1"
-  [ -z "$mountdir" ] && die "ERROR: missing argument for 'mountdir'"
-  [ -d "$mountdir" ] || die "ERROR: 'mountdir' does not exist: $mountdir"
-}
-
 _is_dir_mounted() {
-  local mountdir="$1"
-  if [ "$(mount | grep -c "$mountdir")" -eq 0 ]; then
+  local mountpath="$1"
+  if [ "$(mount | grep -c "$mountpath")" -eq 0 ]; then
     return 1  # not mounted
   fi
   return 0  # mounted
 }
 
-_get_mountdir() {
+_get_mountpath() {
   local host=$1
   echo "$SSHM_BASE_MOUNTDIR/$host"
 }
 
 _display_host_status() {
   local host=$1
-  local mountdir
-  mountdir=$(_get_mountdir "$host")
-  if _is_dir_mounted "$mountdir"; then
-    printf "%-14s %-32s %s\\n" "$host" "$mountdir" "${SSHM_CONFIG[$host]}"
+  local mountpath
+  mountpath=$(_get_mountpath "$host")
+  if _is_dir_mounted "$mountpath"; then
+    printf "%-14s %-32s %s\\n" "$host" "$mountpath" "${SSHM_CONFIG[$host]}"
   else
     printf "%-14s %-32s %s\\n" "$host" "--" "${SSHM_CONFIG[$host]}"
   fi
@@ -167,10 +163,10 @@ list_hosts() {
 query_mounted() {
   local host
   local found_mount=
-  local mountdir
+  local mountpath
   for host in "${SSHM_SORTED_HOSTS[@]}"; do
-    mountdir=$(_get_mountdir "$host")
-    if _is_dir_mounted "$mountdir"; then
+    mountpath=$(_get_mountpath "$host")
+    if _is_dir_mounted "$mountpath"; then
       _display_host_status "$host"
       found_mount=1
     fi
@@ -197,7 +193,7 @@ mount_host() {
   read -r -a config <<< "${SSHM_CONFIG[$host]}"
 
   local mountpath
-  mountpath=$(_get_mountdir "$host")
+  mountpath=$(_get_mountpath "$host")
   if [ ${#config[*]} -gt 1 ]; then 
     mountpath=${config[2]}
   fi
@@ -221,6 +217,16 @@ mount_host() {
   echo "Mounted: ${config[0]} at $mountpath" 
 }
 
+_do_unmount_host() {
+  local mountpath=$1
+  fusermount -u "$mountpath"
+  check_rc_die $? "Command failed: fusermount -u $mountpath"
+  log_info "Unmounted: $mountpath" 
+  if [ "$SSHM_RMDIR_ON_UNMOUNT" = true ]; then
+    rmdir "$mountpath"
+  fi
+}
+
 unmount_host() {
   # The format of the sshm_config file is user@host:path mountpath sshfs options...
   local host=$1
@@ -228,23 +234,29 @@ unmount_host() {
   if [ -z "${SSHM_CONFIG[$host]:-""}" ]; then
     die "Host not found in sshm_config: $host"
   fi
-
   local mountpath
-  mountpath=$(_get_mountdir "$host")
+  mountpath=$(_get_mountpath "$host")
+  log_progress "Unmounting $host from mountpath"
   read -r -a config <<< "${SSHM_CONFIG[$host]}"
   if [ ${#config[*]} -gt 1 ]; then 
     mountpath=${config[2]}
   fi
-
   if ! _is_dir_mounted "$mountpath"; then
     die "Not mounted at $mountpath"
+  else
+    _do_unmount_host "$mountpath"
   fi
-  fusermount -u "$mountpath"
-  check_rc_die $? "Command failed: fusermount -u $mountpath"
-  echo "Unmounted: $mountpath" 
-  if [ "$SSHM_RMDIR_ON_UNMOUNT" = true ]; then
-    rmdir "$mountpath"
-  fi
+}
+
+unmount_all() {
+  local host
+  local mountpath
+  for host in "${SSHM_SORTED_HOSTS[@]}"; do
+    mountpath=$(_get_mountpath "$host")
+    if _is_dir_mounted "$mountpath"; then
+      _do_unmount_host "$mountpath"
+    fi
+  done
 }
 
 
@@ -267,15 +279,22 @@ main() {
         ;;
       -q|--query|--query-mounted)
         arg_query=1
+        break
         ;;
-      -a|--query-all)
+      -a|-qa|--query-all)
         arg_query_all=1
+        break
         ;;
       -l|--list-hosts)
         arg_list_hosts=1
+        break
         ;;
       -u|--unmount)
         arg_mount_cmd=unmount
+        ;;
+      -ua|--unmountall)
+        arg_mount_cmd=unmountall
+        break
         ;;
       -m|--mount)
         arg_mount_cmd=mount
@@ -285,10 +304,11 @@ main() {
         arg_host="$1"
         ;;
       *)
-        if [ ! -z "$arg_host" ]; then
+        if [ -z "$arg_host" ]; then
+          arg_host="$1"
+        else
           die "incorrect args [-h/--help for help]"
         fi
-        arg_host="$1"
         ;;
     esac
     shift
@@ -316,6 +336,9 @@ main() {
       if [ ! -z "$arg_host" ]; then
         unmount_host "$arg_host"
       fi
+      ;;
+    unmountall)
+      unmount_all
       ;;
   esac
 }
