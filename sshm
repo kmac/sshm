@@ -136,10 +136,9 @@ check_mountdir_args() {
 _is_dir_mounted() {
   local mountdir="$1"
   if [ "$(mount | grep -c "$mountdir")" -eq 0 ]; then
-    return 1
+    return 1  # not mounted
   fi
-  # mounted:
-  return 0
+  return 0  # mounted
 }
 
 _get_mountdir() {
@@ -149,7 +148,6 @@ _get_mountdir() {
 
 _display_host_status() {
   local host=$1
-  # printf "%-14s %-12s %s\\n" "$host" "$(_display_is_host_mounted "$host")" "${SSHM_CONFIG[$host]}"
   local mountdir
   mountdir=$(_get_mountdir "$host")
   if _is_dir_mounted "$mountdir"; then
@@ -159,23 +157,9 @@ _display_host_status() {
   fi
 }
 
-# _display_is_host_mounted() {
-#   local host=$1
-#   local mountdir
-#   mountdir=$(_get_mountdir "$host")
-#   if [ ! -d "$mountdir" ]; then
-#     colorecho -n red "not mounted (no local directory)"
-#   elif _is_dir_mounted "$mountdir"; then
-#     colorecho -n green "mounted"
-#   else
-#     colorecho -n yellow "not mounted"
-#   fi
-# }
-
 list_hosts() {
   local host
   for host in "${SSHM_SORTED_HOSTS[@]}"; do
-    #echo -n "$host "
     echo "$host"
   done
 }
