@@ -11,13 +11,10 @@ Then you can easily mount/unmount/query status of the mounts using the `sshm` sc
 
 ### Getting Started
 
-Pre-requisite: Ensure you have a working version of `sshfs` installed.
-
-Clone this repository. 
-
-Add the `sshm` script to your path.
-
-Setup the `sshm_config` file.
+- Pre-requisite: Ensure you have a working version of [sshfs](https://github.com/libfuse/sshfs) installed.
+- Clone this repository. 
+- Add the `sshm` script to your path.
+- Setup the `sshm_config` file.
 
 
 ### Usage
