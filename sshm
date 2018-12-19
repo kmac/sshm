@@ -1,0 +1,343 @@
+#!/bin/bash
+# vim: set filetype=sh:
+# shellcheck disable=SC2236  # I prefer [ ! -z ] for readability
+set -o nounset;  # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o pipefail; # Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+# set -o errexit;  # Exit on error. Append "|| true" if you expect an error.
+# set -o errtrace; # Exit on error inside any functions or subshells.
+# set -o xtrace;   # Turn on traces, useful while debugging but commented out by default
+
+################################################################################
+# Helpers
+
+readonly SCRIPTNAME=$(basename "$0")
+readonly SCRIPTDIR=$(readlink -m "$(dirname "$0")")
+
+# Options to log output to file (see http://mywiki.wooledge.org/BashFAQ/106)
+#exec >"${SCRIPTNAME}.log" 2>&1
+#exec > >(tee "${SCRIPTNAME}.log") 2>&1 
+
+
+# Configuration:
+#
+SSHM_CONFIG_FILE=${SSHM_CONFIG_FILE:-"$HOME/.ssh/sshm_config"}
+SSHM_BASE_MOUNTDIR=${SSHM_BASE_MOUNTDIR:-"$HOME/mnt"}
+SSHM_RMDIR_ON_UNMOUNT=${SSHM_RMDIR_ON_UNMOUNT:-true}
+SSHM_MOUNT_OPTIONS=${SSHM_MOUNT_OPTIONS:-"-o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3"}
+
+
+# Variables:
+#
+DEBUG=
+declare -A SSHM_CONFIG
+declare -a SSHM_SORTED_HOSTS
+
+
+help() {
+cat<<EOF
+SSHFS mount management
+
+USAGE: 
+  $SCRIPTNAME <options> [host]
+
+ARGUMENTS:
+  [host]: The hostname to mount/unmount
+
+OPTIONS:
+  -h|--help: print this help
+
+  -m|--mount       Mount the given host
+  -u|--unmount     Unmount the given host
+  -q|--query:      Show mounts
+  -a|--query-all:  Query the configuration and show mount status
+  -l|--list-hosts: List the configured hosts
+
+SSHM_CONFIG_FILE:
+
+Uses \$SSHM_CONFIG_FILE (default: \$HOME/.ssh/sshm_config) which is a list of entries of form:
+
+    user@host:path mountpath <sshfs options...>
+
+Entries can be commented out using standard '#' prefix
+
+EXAMPLES:
+    sshm -m myhost  # mount 'myhost', as defined in $SSHM_CONFIG_FILE
+    sshm -u myhost  # unmount 'myhost', as defined in $SSHM_CONFIG_FILE
+    sshm -q         # shows mounted hosts
+    sshm -a         # shows all hosts
+EOF
+exit 1
+}
+
+die() { >&2 colorecho red "FATAL: $*"; exit 1; }
+die_with_rc() { local rc=$1; shift; >&2 colorecho red "FATAL: $*, rc=$rc"; exit "$rc"; }
+check_rc_die() { local rc=$1; shift; [ "$rc" -ne 0 ] && die_with_rc "$rc" "$@"; }
+log_error() { >&2 colorecho red "ERROR: $*"; }
+log_warn() { >&2 colorecho orange "$*"; }
+log_info() { >&2 echo "$*"; }
+log_debug() { [ ! -z "$DEBUG" ] && >&2 echo "DEBUG: $*"; }
+log_progress() { >&2 colorecho green "$*"; }
+
+colorecho() {  # usage: colorecho <colour> <text> or colorecho -n <colour> <text>
+  local echo_arg=
+  if [ "$1" = "-n" ]; then echo_arg="-n"; shift; fi
+  local colour="$1"; shift
+  case "${colour}" in
+    red) echo $echo_arg -e "$(tput setaf 1)$*$(tput sgr0)"; ;;
+    green) echo $echo_arg -e "$(tput setaf 2)$*$(tput sgr0)"; ;;
+    green-bold) echo $echo_arg -e "$(tput setaf 2; tput bold)$*$(tput sgr0)"; ;;
+    yellow) echo $echo_arg -e "$(tput setaf 3; tput bold)$*$(tput sgr0)"; ;;
+    orange) echo $echo_arg -e "$(tput setaf 3)$*$(tput sgr0)"; ;;
+    blue) echo $echo_arg -e "$(tput setaf 4)$*$(tput sgr0)"; ;;
+    purple) echo $echo_arg -e "$(tput setaf 5)$*$(tput sgr0)"; ;;
+    cyan) echo $echo_arg -e "$(tput setaf 6)$*$(tput sgr0)"; ;;
+    bold) echo $echo_arg -e "$(tput bold)$*$(tput sgr0)"; ;;
+    normal|*) echo $echo_arg -e "$*"; ;;
+  esac
+}
+
+# may want to cleanup on exit:
+#trap_cleanup() {   echo ""; }
+#trap trap_cleanup EXIT
+#trap 'rc=$?; echo "Caught abnormal signal rc=$rc"; exit $rc' 2 3 15
+
+
+################################################################################
+# Script Functions
+
+parse_sshm_config() {
+  # The format of the sshm_config file is user@host:path mountpath sshfs options...
+  if [ ! -f "$SSHM_CONFIG_FILE" ]; then
+    die "Config file not found: $SSHM_CONFIG_FILE"
+  fi
+  local host
+  # local host user dir
+  while IFS= read -r line; do
+    log_debug "Line: $line"
+    host=${line#*@}; host=${host%:*}  # host has to be parsed in two steps
+    # user=${line%@*}
+    # dir=${line#*:}
+    SSHM_CONFIG[$host]="$line"
+    SSHM_SORTED_HOSTS+=("$host")
+  done < <(grep -v '^ *#' < "$SSHM_CONFIG_FILE")
+
+  # sort SSHM_SORTED_HOSTS (see https://stackoverflow.com/a/7442583)
+  # shellcheck disable=SC2207
+  IFS=$'\n' SSHM_SORTED_HOSTS=($(sort <<<"${SSHM_SORTED_HOSTS[*]}"))
+  unset IFS
+}
+
+check_mountdir_args() {
+  local mountdir="$1"
+  [ -z "$mountdir" ] && die "ERROR: missing argument for 'mountdir'"
+  [ -d "$mountdir" ] || die "ERROR: 'mountdir' does not exist: $mountdir"
+}
+
+_is_dir_mounted() {
+  local mountdir="$1"
+  if [ "$(mount | grep -c "$mountdir")" -eq 0 ]; then
+    return 1
+  fi
+  # mounted:
+  return 0
+}
+
+_get_mountdir() {
+  local host=$1
+  echo "$SSHM_BASE_MOUNTDIR/$host"
+}
+
+_display_host_status() {
+  local host=$1
+  # printf "%-14s %-12s %s\\n" "$host" "$(_display_is_host_mounted "$host")" "${SSHM_CONFIG[$host]}"
+  local mountdir
+  mountdir=$(_get_mountdir "$host")
+  if _is_dir_mounted "$mountdir"; then
+    printf "%-14s %-32s %s\\n" "$host" "$mountdir" "${SSHM_CONFIG[$host]}"
+  else
+    printf "%-14s %-32s %s\\n" "$host" "--" "${SSHM_CONFIG[$host]}"
+  fi
+}
+
+# _display_is_host_mounted() {
+#   local host=$1
+#   local mountdir
+#   mountdir=$(_get_mountdir "$host")
+#   if [ ! -d "$mountdir" ]; then
+#     colorecho -n red "not mounted (no local directory)"
+#   elif _is_dir_mounted "$mountdir"; then
+#     colorecho -n green "mounted"
+#   else
+#     colorecho -n yellow "not mounted"
+#   fi
+# }
+
+list_hosts() {
+  local host
+  for host in "${SSHM_SORTED_HOSTS[@]}"; do
+    #echo -n "$host "
+    echo "$host"
+  done
+}
+
+query_mounted() {
+  local host
+  local found_mount=
+  local mountdir
+  for host in "${SSHM_SORTED_HOSTS[@]}"; do
+    mountdir=$(_get_mountdir "$host")
+    if _is_dir_mounted "$mountdir"; then
+      _display_host_status "$host"
+      found_mount=1
+    fi
+  done
+  if [ -z "$found_mount" ]; then
+    echo "No mounts"
+  fi
+}
+
+query_all() {
+  local host
+  for host in "${SSHM_SORTED_HOSTS[@]}"; do
+    _display_host_status "$host"
+  done
+}
+
+mount_host() {
+  # The format of the sshm_config file is user@host:path mountpath sshfs options...
+  local host=$1
+  local config
+  if [ -z "${SSHM_CONFIG[$host]:-""}" ]; then
+    die "Host not found in sshm_config: $host"
+  fi
+  read -r -a config <<< "${SSHM_CONFIG[$host]}"
+
+  local mountpath
+  mountpath=$(_get_mountdir "$host")
+  if [ ${#config[*]} -gt 1 ]; then 
+    mountpath=${config[2]}
+  fi
+  if _is_dir_mounted "$mountpath"; then
+    log_warn "Already mounted at $mountpath"
+    exit 0
+  fi
+  if [ ! -d "$mountpath" ]; then
+    log_progress "Creating $mountpath"
+    mkdir "$mountpath" || die "Could not create $mountpath, rc=$?"
+  fi
+  local sshfs_mount_options=$SSHM_MOUNT_OPTIONS
+  if [ ${#config[*]} -gt 2 ]; then 
+    # sshfs options are provided, use them (not defaults)
+    sshfs_mount_options=${config[*]:2}
+  fi
+
+  # shellcheck disable=SC2086
+  sshfs ${config[0]} "$mountpath" $sshfs_mount_options
+  check_rc_die $? "sshfs failed"
+  echo "Mounted: ${config[0]} at $mountpath" 
+}
+
+unmount_host() {
+  # The format of the sshm_config file is user@host:path mountpath sshfs options...
+  local host=$1
+  local config
+  if [ -z "${SSHM_CONFIG[$host]:-""}" ]; then
+    die "Host not found in sshm_config: $host"
+  fi
+
+  local mountpath
+  mountpath=$(_get_mountdir "$host")
+  read -r -a config <<< "${SSHM_CONFIG[$host]}"
+  if [ ${#config[*]} -gt 1 ]; then 
+    mountpath=${config[2]}
+  fi
+
+  if ! _is_dir_mounted "$mountpath"; then
+    die "Not mounted at $mountpath"
+  fi
+  fusermount -u "$mountpath"
+  check_rc_die $? "Command failed: fusermount -u $mountpath"
+  echo "Unmounted: $mountpath" 
+  if [ "$SSHM_RMDIR_ON_UNMOUNT" = true ]; then
+    rmdir "$mountpath"
+  fi
+}
+
+
+################################################################################
+# Main
+
+main() {
+  local arg_host=
+  local arg_query=
+  local arg_query_all=
+  local arg_list_hosts=
+  local arg_mount_cmd=mount
+  while [ $# -gt 0 ] ; do
+    case "${1:-""}" in
+      -h|--help)
+        help
+        ;;
+      -D|--debug)
+        DEBUG=1
+        ;;
+      -q|--query|--query-mounted)
+        arg_query=1
+        ;;
+      -a|--query-all)
+        arg_query_all=1
+        ;;
+      -l|--list-hosts)
+        arg_list_hosts=1
+        ;;
+      -u|--unmount)
+        arg_mount_cmd=unmount
+        ;;
+      -m|--mount)
+        arg_mount_cmd=mount
+        ;;
+      --host)
+        shift
+        arg_host="$1"
+        ;;
+      *)
+        if [ ! -z "$arg_host" ]; then
+          die "incorrect args [-h/--help for help]"
+        fi
+        arg_host="$1"
+        ;;
+    esac
+    shift
+  done
+  parse_sshm_config
+  if [ ! -z "$arg_list_hosts" ]; then
+    list_hosts
+    exit 0
+  fi
+  if [ ! -z "$arg_query" ]; then
+    query_mounted
+    exit 0
+  fi
+  if [ ! -z "$arg_query_all" ]; then
+    query_all
+    exit 0
+  fi
+  case "$arg_mount_cmd" in
+    mount)
+      if [ ! -z "$arg_host" ]; then
+        mount_host "$arg_host"
+      fi
+      ;;
+    unmount)
+      if [ ! -z "$arg_host" ]; then
+        unmount_host "$arg_host"
+      fi
+      ;;
+  esac
+}
+
+# Execute main if script is executed directly (not sourced):
+# This allows for shunit2 testing (https://github.com/kward/shunit2)
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi

@@ -1,0 +1,23 @@
+# sshm_config
+# -----------
+#
+# This file is a list of entries of form:
+#   user@host:remotepath mountpath <sshfs options...>
+#
+# Note: the first part of the entry respects entries in ~/.ssh/config, so if you have the server
+# defined there you don't need to repeat the information here.
+# 
+# This mounts the home directory of someuser@someserver into your local $HOME/mnt/someserver:
+# someuser@someserver:~/
+# 
+# Same as above, but uses the user as defined in ~/.ssh/config:
+# someserver:~/
+# 
+# Mount the remote /opt directory instead of home; the local directory is still $HOME/mnt/someserver:
+# someuser@someserver:/opt
+# 
+# Mount the remote /opt directory into your /opt (you would need to create local /opt with permissions first):
+# someuser@someserver:/opt /opt
+# 
+# You can override the default sshfs options on a per-entry basis as follows:
+# someuser@someserver:/opt /opt -o reconnect,ServerAliveInterval=30,ServerAliveCountMax=3
