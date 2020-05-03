@@ -21,7 +21,7 @@ readonly SCRIPTNAME=$(basename "$0")
 # Configuration:
 #
 SSHM_CONFIG_FILE=${SSHM_CONFIG_FILE:-"$HOME/.ssh/sshm_config"}
-SSHM_BASE_MOUNTDIR=${SSHM_BASE_MOUNTDIR:-"$HOME/mnt"}
+SSHM_BASE_MOUNTDIR=${SSHM_BASE_MOUNTDIR:-/mnt}  # you may prefer "$HOME/mnt" if no access to /mnt 
 SSHM_RMDIR_ON_UNMOUNT=${SSHM_RMDIR_ON_UNMOUNT:-false}
 SSHM_MOUNT_OPTIONS=${SSHM_MOUNT_OPTIONS:-"-o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3"}
 
@@ -131,10 +131,8 @@ parse_sshm_config() {
 
 _is_dir_mounted() {
   local mountpath="$1"
-  if [ "$(mount | grep -c "$mountpath")" -eq 0 ]; then
-    return 1  # not mounted
-  fi
-  return 0  # mounted
+  findmnt "$mountpath" >/dev/null 2>&1 
+  return $?
 }
 
 _get_mountpath() {
